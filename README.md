@@ -24,6 +24,23 @@ Componentes:
 | MySQL del monolito | Origen de los datos, acceso solo de lectura |
 | MongoDB 7 (Docker) | Destino: colecciones `clientes`, `pagos` y `sync_jobs` |
 
+Diagrama en Lucidchart (solo lectura): https://lucid.app/lucidchart/d20c5bd6-b393-4874-8fe2-66d5c58f1c8f/view
+
+### Qué representa cada conexión del diagrama
+
+| N.º | Conexión | Qué ocurre |
+|---|---|---|
+| 1 | Cliente → `SyncController` | `POST /api/sync/jobs` pide iniciar una sincronización. |
+| 2 | `SyncController` → `SyncService` | Llama a `iniciar()`, que crea el trabajo y lo lanza en segundo plano con `CompletableFuture`. Si ya hay uno `EN_PROCESO`, no crea otro. |
+| 3 | `SyncController` → Cliente | Responde `202` con el `jobId`, o `409` si ya hay una sincronización en curso. |
+| 4 | `SyncService` → MySQL | Lee clientes y pagos por JDBC con un usuario de solo lectura (`SELECT` con `JOIN`). |
+| 5a, 5b | `SyncService` → colecciones `clientes` y `pagos` | Calcula un hash SHA-256 por registro. Inserta si no existe, actualiza si el hash cambió y omite si es igual. Nunca borra. |
+| 6 | `SyncService` → `SyncJobRepository` | Guarda el progreso (0-100) y los contadores del trabajo. |
+| 7 | Cliente → `SyncController` | `GET /api/sync/jobs/{id}` consulta el estado del trabajo. |
+| 8 | `SyncController` → `SyncService` | Llama a `buscar(id)`, que lee el trabajo guardado en `sync_jobs`. |
+| Línea punteada | Monolito → MySQL | El monolito sigue escribiendo en su propia base. Este servicio no lo modifica. |
+| Swagger | Swagger UI → `SyncController` | Documenta y permite probar los endpoints desde `/swagger-ui.html`. |
+
 ## 1. Funcionalidad y objetivo
 
 La Oficina del Agua opera con un sistema heredado en MySQL que no puede modificarse. Este servicio mantiene una copia de sus datos en MongoDB, útil para consultas y reportes que no deben cargar al sistema original.
