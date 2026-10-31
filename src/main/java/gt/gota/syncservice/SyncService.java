@@ -22,10 +22,12 @@ public class SyncService {
 
     private static final String EN_PROCESO = "EN_PROCESO";
 
+    // clientes tal cual estan en MySQL
     private static final String SQL_CLIENTES =
             "SELECT id, nombre, telefono, direccion, email, fecha_registro, activo "
             + "FROM Clientes ORDER BY id";
 
+    // pagos con su lectura, contador y cliente (JOIN)
     private static final String SQL_PAGOS =
             "SELECT p.id, p.monto, p.fecha_pago, p.metodo, p.estado, p.comprobante, p.observaciones, "
             + "l.id AS lectura_id, l.periodo, l.consumo, l.monto_total, "
@@ -37,11 +39,11 @@ public class SyncService {
             + "JOIN Clientes cl ON cl.id = c.cliente_id "
             + "ORDER BY p.id";
 
-    private final SyncJobRepository repo;
-    private final JdbcTemplate jdbc;
-    private final MongoTemplate mongo;
+    private final SyncJobRepository repo; // jobs en Mongo
+    private final JdbcTemplate jdbc; // lectura de MySQL
+    private final MongoTemplate mongo; // escritura en Mongo
 
-    // Pausa entre registros, solo para demostraciones (0 = sin pausa)
+    // pausa entre registros, solo para la demo (0 = sin pausa)
     @Value("${sync.demora-ms:0}")
     private long demoraMs;
 
@@ -51,8 +53,7 @@ public class SyncService {
         this.mongo = mongo;
     }
 
-    // Si el servicio se apagó con un trabajo a medias, ese trabajo quedaría
-    // "EN_PROCESO" para siempre y bloquearía las siguientes sincronizaciones.
+    // al arrancar: marca como FALLIDO los jobs que quedaron EN_PROCESO
     @EventListener(ApplicationReadyEvent.class)
     public void limpiarTrabajosHuerfanos() {
         for (SyncJob j : repo.findByEstado(EN_PROCESO)) {
@@ -63,8 +64,9 @@ public class SyncService {
         }
     }
 
-    // synchronized evita que dos peticiones simultaneas pasen la revision a la vez
+    // crea el job y lanza la copia en segundo plano (vacio si ya hay uno corriendo)
     public synchronized Optional<SyncJob> iniciar() {
+        // si ya hay uno en proceso, no se crea otro
         if (repo.existsByEstado(EN_PROCESO)) {
             return Optional.empty();
         }
@@ -74,22 +76,27 @@ public class SyncService {
         job.setIniciadoEn(LocalDateTime.now());
         job = repo.save(job);
 
+        // la copia corre en otro hilo, por eso el POST responde de inmediato
         String id = job.getId();
         CompletableFuture.runAsync(() -> ejecutar(id));
         return Optional.of(job);
     }
 
+    // job que esta corriendo ahora
     public Optional<SyncJob> enCurso() {
         return repo.findFirstByEstado(EN_PROCESO);
     }
 
+    // busca un job por id
     public Optional<SyncJob> buscar(String id) {
         return repo.findById(id);
     }
 
+    // hace la copia completa (corre en otro hilo)
     private void ejecutar(String id) {
         SyncJob job = repo.findById(id).orElseThrow();
         try {
+            // lee MySQL
             List<Map<String, Object>> clientes = jdbc.queryForList(SQL_CLIENTES);
             List<Map<String, Object>> pagos = jdbc.queryForList(SQL_PAGOS);
             job.setTotal(clientes.size() + pagos.size());
@@ -97,7 +104,9 @@ public class SyncService {
 
             int procesados = 0;
 
+            // clientes
             for (Map<String, Object> f : clientes) {
+                // el _id es el id de MySQL
                 Document doc = new Document("_id", num(f.get("id")).longValue())
                         .append("nombre", f.get("nombre"))
                         .append("telefono", f.get("telefono"))
@@ -110,6 +119,7 @@ public class SyncService {
                 actualizarProgreso(job, procesados);
             }
 
+            // pagos, con lectura, contador y cliente incrustados
             for (Map<String, Object> f : pagos) {
                 Document lectura = new Document("id", num(f.get("lectura_id")).longValue())
                         .append("periodo", str(f.get("periodo")))
@@ -139,6 +149,7 @@ public class SyncService {
             job.setProgreso(100);
             job.setEstado("COMPLETADO");
         } catch (Exception e) {
+            // cualquier error deja el job como FALLIDO
             job.setEstado("FALLIDO");
             job.setError(e.getMessage());
         }
@@ -146,31 +157,40 @@ public class SyncService {
         repo.save(job);
     }
 
+    // inserta, actualiza u omite un documento segun su hash
     private void sincronizar(SyncJob job, String coleccion, Document doc) throws Exception {
         Object id = doc.get("_id");
+        // calcula el hash del registro y lo guarda en _hash
         String hash = calcularHash(doc);
         doc.append("_hash", hash);
 
+        // busca el documento en Mongo por _id
         Document existente = mongo.findById(id, Document.class, coleccion);
         if (existente == null) {
+            // no existe: inserta
             mongo.save(doc, coleccion);
             job.setInsertados(job.getInsertados() + 1);
         } else if (!hash.equals(existente.getString("_hash"))) {
+            // hash distinto: actualiza
             mongo.save(doc, coleccion);
             job.setActualizados(job.getActualizados() + 1);
         } else {
+            // hash igual: no hace nada
             job.setSinCambios(job.getSinCambios() + 1);
         }
     }
 
-     private void actualizarProgreso(SyncJob job, int procesados) {
+    // guarda el porcentaje de avance en el job
+    private void actualizarProgreso(SyncJob job, int procesados) {
         job.setProgreso(procesados * 100 / job.getTotal());
         repo.save(job);
+        // sin pausa en el ultimo registro
         if (procesados < job.getTotal()) {
             pausa();
         }
     }
 
+    // pausa para la demo
     private void pausa() {
         if (demoraMs > 0) {
             try {
@@ -181,7 +201,7 @@ public class SyncService {
         }
     }
 
-    // El hash se calcula con todos los campos del documento, menos el _id
+    // SHA-256 de todos los campos menos _id
     private String calcularHash(Document d) throws Exception {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, Object> e : d.entrySet()) {
@@ -193,6 +213,7 @@ public class SyncService {
         return HexFormat.of().formatHex(md.digest(sb.toString().getBytes(StandardCharsets.UTF_8)));
     }
 
+    // conversores de tipos (MySQL devuelve Object)
     private static Number num(Object o) {
         return (Number) o;
     }
